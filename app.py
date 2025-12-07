@@ -5,15 +5,20 @@ import os
 import time
 from ultralytics import YOLO
 import supervision as sv
+import traceback
+
+from constants import (
+    MAX_DIRECT_SIDE,
+    SAHI_SLICE_WH,
+    SAHI_OVERLAP_WH,
+    SAHI_WORKERS,
+)
 
 
 @st.cache_resource
 def load_model(model_path: str):
     """Charge et met en cache un modèle YOLO pour un chemin donné."""
     return YOLO(model_path)
-
-
-MAX_DIRECT_SIDE = 1280
 
 
 def create_box_annotator(style: str, thickness: int, palette: sv.ColorPalette | None):
@@ -40,12 +45,53 @@ def create_box_annotator(style: str, thickness: int, palette: sv.ColorPalette | 
     return sv.BoxAnnotator(thickness=thickness, **color_kwargs)
 
 
+def build_labels(detections: sv.Detections, model, label_mode: str) -> list[str]:
+    """Construit la liste de labels à partir des détections et du modèle.
+
+    - "Aucun" -> liste vide
+    - "Label seulement" -> nom de classe
+    - "Score seulement" -> score
+    - "Label + score" -> nom + score
+    """
+
+    if label_mode == "Aucun":
+        return []
+
+    labels: list[str] = []
+
+    if detections.class_id is not None and detections.confidence is not None:
+        for class_id, confidence in zip(detections.class_id, detections.confidence):
+            class_name = model.model.names[class_id]
+            if label_mode == "Label seulement":
+                labels.append(f"{class_name}")
+            elif label_mode == "Score seulement":
+                labels.append(f"{confidence:.2f}")
+            elif label_mode == "Label + score":
+                labels.append(f"{class_name} {confidence:.2f}")
+
+    return labels
+
+
+def format_duration(seconds: float) -> str:
+    """Formate une durée en secondes.
+
+    - < 60 s  -> "XX.X secondes"
+    - >= 60 s -> "YY.Y minutes"
+    """
+
+    if seconds >= 60:
+        minutes = seconds / 60.0
+        return f"{minutes:.1f} minutes"
+    return f"{seconds:.1f} secondes"
+
+
 def run_detections(
     frame,
     model,
     conf_threshold: float,
     iou_threshold: float,
     use_sahi: bool,
+    sahi_config: dict | None = None,
 ):
     """Calcule les détections sur une frame.
 
@@ -68,16 +114,31 @@ def run_detections(
         )[0]
         return sv.Detections.from_ultralytics(results)
 
+    if sahi_config is None:
+        slice_wh = SAHI_SLICE_WH
+        overlap_wh = SAHI_OVERLAP_WH
+        sahi_workers = SAHI_WORKERS
+    else:
+        slice_wh = sahi_config.get("slice_wh", SAHI_SLICE_WH)
+        overlap_wh = sahi_config.get("overlap_wh", SAHI_OVERLAP_WH)
+        sahi_workers = sahi_config.get("sahi_workers", SAHI_WORKERS)
+
     slicer = sv.InferenceSlicer(
         callback=callback,
-        slice_wh=(768, 768),
-        overlap_ratio_wh=(0.2, 0.2),
+        slice_wh=slice_wh,
+        overlap_wh=overlap_wh,
+        iou_threshold=iou_threshold,
+        thread_workers=sahi_workers,
     )
 
     return slicer(image=frame)
 
 
-st.set_page_config(page_title="Bbox Stories", layout="wide")
+st.set_page_config(
+    page_title="Bbox Stories",
+    layout="wide",
+    page_icon="assets/logo.png",
+)
 
 st.title("� Bbox Stories")
 st.markdown(
@@ -90,7 +151,11 @@ st.sidebar.header("Configuration")
 # Sélection du modèle
 model_type = st.sidebar.radio(
     "Source du modèle",
-    ("Modèles pré-entraînés (YOLO11)", "Charger un modèle personnalisé (.pt)")
+    ("Modèles pré-entraînés (YOLO11)", "Charger un modèle personnalisé (.pt)"),
+    help=(
+        "Choisissez un modèle YOLO11 intégré ou chargez votre propre .pt. "
+        "Les modèles plus gros (l, x) sont plus précis mais plus lents."
+    ),
 )
 
 model_path = None
@@ -99,6 +164,10 @@ if model_type == "Modèles pré-entraînés (YOLO11)":
     selected_model = st.sidebar.selectbox(
         "Choisir un modèle YOLO11",
         ["yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolo11l.pt", "yolo11x.pt"],
+        help=(
+            "n = plus petit et rapide, x = plus grand et précis. "
+            "Commencez par yolo11n pour tester, passez à plus gros si besoin."
+        ),
     )
     model_path = selected_model
 else:
@@ -112,19 +181,27 @@ else:
 # Paramètres de détection
 st.sidebar.subheader("Paramètres de détection")
 
-conf_options = [0.2, 0.3, 0.4, 0.5, 0.6]
-iou_options = [0.3, 0.4, 0.5, 0.6, 0.7]
+conf_options = [0.2, 0.4, 0.6]
+iou_options = [0.2,0.3, 0.4, 0.5] # un IOU 0.2 signifie
 
 conf_threshold = st.sidebar.selectbox(
     "Seuil de confiance",
     options=conf_options,
-    index=2,  # 0.4 par défaut
+    index=1,  # 0.4 par défaut
+    help=(
+        "Score minimal pour garder une prédiction. "
+        "Plus haut = moins de faux positifs mais plus de ratés."
+    ),
 )
 
 iou_threshold = st.sidebar.selectbox(
     "Seuil IOU",
     options=iou_options,
-    index=2,  # 0.5 par défaut
+    index=1,  # 0.3 par défaut
+    help=(
+        "IoU utilisé pour fusionner les bbox qui se chevauchent. "
+        "Plus haut = moins de fusions, plus bas = plus d'agressivité."
+    ),
 )
 
 # Style visuel des bbox
@@ -134,6 +211,7 @@ bbox_thickness = st.sidebar.selectbox(
     "Épaisseur des bbox",
     options=[1, 2, 4, 8, 16],
     index=1,  # 2 par défaut
+    help="Épaisseur des contours des boîtes. Plus haut = boîtes plus visibles.",
 )
 
 bbox_style_map = {
@@ -150,6 +228,7 @@ selected_bbox_style_label = st.sidebar.selectbox(
     "Style de bbox",
     options=list(bbox_style_map.keys()),
     index=0,
+    help="Forme des boîtes : rectangle classique, coins, cercles, tracés, etc.",
 )
 
 bbox_style = bbox_style_map[selected_bbox_style_label]
@@ -186,6 +265,10 @@ palette_choice = st.sidebar.selectbox(
     "Palette de couleurs",
     options=palette_labels,
     index=0,
+    help=(
+        "Couleurs utilisées pour les classes. 'Aucune' laisse la palette par défaut, "
+        "les autres appliquent un dégradé de couleurs."
+    ),
 )
 
 bbox_palette = None
@@ -206,6 +289,10 @@ label_mode = st.sidebar.selectbox(
         "Label + score",
     ],
     index=3,
+    help=(
+        "Choisissez si vous voulez voir le nom de la classe, le score de confiance "
+        "ou les deux au-dessus des boîtes."
+    ),
 )
 
 # "Puissances de 2" pour l'échelle de texte (labels)
@@ -214,6 +301,7 @@ if label_mode != "Aucun":
         "Taille des labels",
         options=[0.25, 0.5, 1.0, 2.0],  # ~2^-2, 2^-1, 2^0, 2^1
         index=1,  # 0.5 par défaut
+        help="Échelle du texte des labels. Plus haut = texte plus grand.",
     )
 else:
     # valeur par défaut utilisée mais non affichée
@@ -224,10 +312,11 @@ st.sidebar.subheader("SAHI / grandes vidéos")
 
 use_sahi = st.sidebar.checkbox(
     "Activer le découpage (SAHI) pour les grandes images",
-    value=True,
+    value=False,
     help=(
-        "Si l'image est plus grande qu'une certaine taille, elle est découpée en tuiles "
-        "pour la détection, ce qui peut améliorer la détection des petits objets."
+        "Active le découpage de l'image en tuiles (Slicing Adaptive Inference). "
+        "Les paramètres internes (taille des tuiles, chevauchement, workers) "
+        "sont choisis pour un bon compromis qualité/vitesse."
     ),
 )
 
@@ -245,6 +334,32 @@ if uploaded_video and model_path:
     base_name, _ = os.path.splitext(original_name)
 
     st.video(video_path)
+
+    # Informations sur la vidéo
+    try:
+        video_info_meta = sv.VideoInfo.from_video_path(video_path)
+        fps_meta = video_info_meta.fps or 0.0
+        total_frames_meta = video_info_meta.total_frames or 0
+        width_meta = video_info_meta.width
+        height_meta = video_info_meta.height
+
+        duration_s = None
+        if fps_meta and total_frames_meta:
+            duration_s = total_frames_meta / fps_meta
+
+        info_lines = [
+            f"Résolution : {width_meta} x {height_meta} pixels",
+            f"FPS : {fps_meta:.2f}" if fps_meta else "FPS : inconnu",
+            f"Nombre de frames : {total_frames_meta}" if total_frames_meta else "Nombre de frames : inconnu",
+        ]
+
+        if duration_s is not None:
+            info_lines.append(f"Durée estimée : {duration_s:.1f} s")
+
+        st.info(". \n".join(info_lines))
+    except Exception:
+        # Ne pas bloquer si on ne peut pas lire les métadonnées
+        pass
 
     # Chargement du modèle (partagé entre aperçu et traitement complet)
     st.write("Chargement du modèle...")
@@ -286,16 +401,7 @@ if uploaded_video and model_path:
             else:
                 label_annot = sv.LabelAnnotator(text_scale=label_scale)
 
-            labels = []
-            if detections.class_id is not None and detections.confidence is not None:
-                for class_id, confidence in zip(detections.class_id, detections.confidence):
-                    class_name = model.model.names[class_id]
-                    if label_mode == "Label seulement":
-                        labels.append(f"{class_name}")
-                    elif label_mode == "Score seulement":
-                        labels.append(f"{confidence:.2f}")
-                    elif label_mode == "Label + score":
-                        labels.append(f"{class_name} {confidence:.2f}")
+            labels = build_labels(detections, model, label_mode)
 
             annotated = box_annot.annotate(scene=frame.copy(), detections=detections)
             if label_mode != "Aucun" and len(labels) > 0:
@@ -326,10 +432,10 @@ if uploaded_video and model_path:
             cols = st.columns(len(preview_images))
             for col, (title, img) in zip(cols, preview_images):
                 h, w = img.shape[:2]
-                display_width = min(640, w)
+                #display_width = min(640, w)
                 with col:
                     st.caption(title)
-                    st.image(img[:, :, ::-1], width=display_width)
+                    st.image(img[:, :, ::-1],)
         else:
             st.warning("Impossible de générer l'aperçu : aucune frame lisible.")
 
@@ -372,16 +478,7 @@ if uploaded_video and model_path:
 
                     annotated_frame = box_annotator.annotate(scene=frame.copy(), detections=detections)
 
-                    labels = []
-                    if detections.class_id is not None and detections.confidence is not None:
-                        for class_id, confidence in zip(detections.class_id, detections.confidence):
-                            class_name = model.model.names[class_id]
-                            if label_mode == "Label seulement":
-                                labels.append(f"{class_name}")
-                            elif label_mode == "Score seulement":
-                                labels.append(f"{confidence:.2f}")
-                            elif label_mode == "Label + score":
-                                labels.append(f"{class_name} {confidence:.2f}")
+                    labels = build_labels(detections, model, label_mode)
 
                     if label_mode != "Aucun" and len(labels) > 0:
                         annotated_frame = label_annotator.annotate(
@@ -411,11 +508,12 @@ if uploaded_video and model_path:
             writer.release()
 
             elapsed = time.time() - start_time
+            formatted = format_duration(elapsed)
             progress_bar.progress(1.0)
-            status_text.success(f"Traitement terminé en {elapsed:.1f} secondes !")
+            status_text.success(f"Traitement terminé en {formatted} !")
 
             # Notification éphémère
-            st.toast(f"Vidéo traitée en {elapsed:.1f} secondes", icon="✅")
+            st.toast(f"Vidéo traitée en {formatted}", icon="✅")
 
             st.subheader("Résultat")
             st.video(web_output_path)
